@@ -23,7 +23,11 @@ import numpy as np
 import torch
 from vllm import ModelRegistry
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.models.interfaces import (
@@ -66,6 +70,10 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 from vllm_neuron import envs
+from vllm_neuron.vllm.kv_connector.neuron_cpu_offload import (
+    drain_before_transfers,
+    register_kv_caches,
+)
 from vllm_neuron.snapshot.runner_hook import SnapshotRunnerHook
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
@@ -7183,6 +7191,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         self._drop_transition_spec_decode_if_cache_incomplete(scheduler_output)
 
+        if has_kv_transfer_group():
+            drain_before_transfers(
+                get_kv_transfer_group(),
+                scheduler_output.kv_connector_metadata,
+                self.async_execution_buffer.get("async_output"),
+            )
+            # Submit last step's deferred KV stores before this step's forward
+            # can overwrite their blocks (as upstream gpu_model_runner does).
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.kv_connector_metadata
+            )
+
         # Update cached states (includes sequence ID management).
         # _update_states is a verbatim copy of upstream, so the lock goes here. It keeps the
         # async-output thread out of the InputBatch for the whole update. See
@@ -10807,7 +10827,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_caches_view = self.get_kv_cache_view_for_connector_registration(
                 kv_caches
             )
-            get_kv_transfer_group().register_kv_caches(kv_caches_view)
+            register_kv_caches(get_kv_transfer_group(), kv_caches_view)
 
         return kv_caches
 
@@ -11165,7 +11185,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_caches_view = self.get_kv_cache_view_for_connector_registration(
                 kv_caches
             )
-            get_kv_transfer_group().register_kv_caches(kv_caches_view)
+            register_kv_caches(get_kv_transfer_group(), kv_caches_view)
 
         return kv_caches
 
@@ -11673,4 +11693,4 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return tuple(tasks)
 
     def ensure_kv_transfer_shutdown(self) -> None:
-        pass
+        ensure_kv_transfer_shutdown()

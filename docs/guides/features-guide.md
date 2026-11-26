@@ -334,6 +334,61 @@ full design, see [Prefix caching design](../design/vllm/prefix-caching.md).
   queries
 - Chat applications where conversation history is re-sent with each turn
 
+## KV cache offloading
+
+KV cache offloading keeps prefix-cache blocks in host DRAM (and, optionally,
+on local disk) after they leave the device cache, and loads them back on a
+later prefix hit instead of recomputing them. It uses vLLM's native
+`OffloadingConnector`; vLLM Neuron supplies the Neuron device-to-host copies.
+KV offloading runs on Model Runner V1 (selected automatically).
+
+Host DRAM, sized in GiB (total across TP ranks):
+
+```bash
+vllm serve Qwen/Qwen3-8B \
+    --block-size 32 \
+    --kv-offloading-size 16
+```
+
+The equivalent `LLM` argument is `kv_offloading_size=16`.
+
+Host DRAM plus a local filesystem tier (for example an NVMe mount). Blocks
+evicted from host DRAM are kept on disk and read back on a hit, including
+after a restart:
+
+```bash
+vllm serve Qwen/Qwen3-8B \
+    --block-size 32 \
+    --kv-offloading-size 16 \
+    --kv-transfer-config '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
+        "kv_connector_extra_config": {"spec_name": "TieringOffloadingSpec",
+            "secondary_tiers": [{"type": "fs", "root_dir": "/mnt/nvme/kv-cache"}]}}'
+```
+
+The filesystem tier keeps the host tier in a file under `/dev/shm`, so a
+container needs a `/dev/shm` at least as large as `--kv-offloading-size`
+(for example `--shm-size`). The engine removes the file when it shuts down.
+`vllm serve` kills the engine at once on shutdown unless `--shutdown-timeout`
+is above 0, which leaves the file behind, so pass for example
+`--shutdown-timeout 30`.
+
+Offload activity is reported in the `/metrics` counters
+`vllm:kv_offload_store_bytes`, `vllm:kv_offload_load_bytes`,
+`vllm:external_prefix_cache_hits` and, for the filesystem tier,
+`vllm:kv_offload_tiering_read_bytes`.
+
+### When to use KV cache offloading
+
+Use it when repeated prefixes no longer fit in the device KV cache and
+recomputing them is slower than copying them from the host. On Trn3,
+Qwen3-8B, TP=1, a 3000-token prompt served from host DRAM after eviction had
+a time to first token of 0.70 s, against 1.40 s to recompute it.
+
+Copies are synchronous. When prefill is fast, loading is slower than
+recomputing: the same prompt at TP=8 and TP=16 took 0.22 s from host DRAM
+against about 0.15 s to recompute. Each request that stores blocks also pays
+the store time (about 70 ms for that prompt at TP=1).
+
 ## Tensor, data, and expert parallelism
 
 vLLM Neuron exposes three parallelism dimensions:
